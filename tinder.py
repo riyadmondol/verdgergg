@@ -11,25 +11,117 @@ from logging import Logger
 from datetime import datetime, timezone
 from curl_cffi.requests import AsyncSession, WebSocket, Session
 from threading import Thread
+from dataclasses import dataclass
+from typing import Optional, Tuple, Dict, List
 
 from deviceId_iOS import generateDeviceToken
-#from deviceId_iOS_remote import generateDeviceToken
-
-# TODO: blackboxprotobuf => protoc instead
 import blackboxprotobuf
 import blackboxprotobuf.lib.protofile as protofile
 from blackboxprotobuf.lib.config import Config
+
 config = Config()
 typedef_map = protofile.import_proto(config, input_filename='./proto/tinder.proto')
 config.known_types = typedef_map
 
-# headers order: https://github.com/lexiforest/curl_cffi/issues/335
+# Headers order: https://github.com/lexiforest/curl_cffi/issues/335
 http_async_sesion = Session(
     verify=False,
     default_headers=False,
-    impersonate="safari17_2_ios", # its not 14.2
-    #http_version=2 # HTTP 1.1 (prevent HTTP2 framing layer error)
+    impersonate="safari17_2_ios",
 )
+
+@dataclass
+class DeviceProfile:
+    device_model: str
+    os_version: str
+    build_id: str
+    carrier: Optional[str] = None
+    
+    def encode(self) -> str:
+        return base64.b64encode(self.device_model.encode()).decode()
+
+class DeviceProfileManager:
+    # Common iOS devices that support Tinder with full version numbers
+    IOS_DEVICES: List[DeviceProfile] = [
+        DeviceProfile("iPhone8,1", "14.2.0", "18B92", "AT&T"),  # iPhone 6s
+        DeviceProfile("iPhone8,2", "14.2.0", "18B92", "T-Mobile"),  # iPhone 6s Plus
+        DeviceProfile("iPhone9,1", "14.2.0", "18B92", "Verizon"),  # iPhone 7
+        DeviceProfile("iPhone9,3", "14.2.0", "18B92", "Sprint"),  # iPhone 7
+        DeviceProfile("iPhone9,2", "14.2.0", "18B92", "AT&T"),  # iPhone 7 Plus
+        DeviceProfile("iPhone9,4", "14.2.0", "18B92", "T-Mobile"),  # iPhone 7 Plus
+        DeviceProfile("iPhone10,1", "14.2.0", "18B92", "Verizon"),  # iPhone 8
+        DeviceProfile("iPhone10,4", "14.2.0", "18B92", "Sprint"),  # iPhone 8
+        DeviceProfile("iPhone10,2", "14.2.0", "18B92", "AT&T"),  # iPhone 8 Plus
+        DeviceProfile("iPhone10,5", "14.2.0", "18B92", "T-Mobile"),  # iPhone 8 Plus
+    ]
+
+    # Common carriers and their codes
+    CARRIERS: Dict[str, Tuple[int, int]] = {
+        "AT&T": (310, 410),
+        "T-Mobile": (310, 260),
+        "Verizon": (311, 480),
+        "Sprint": (310, 120),
+        "": (0, 0)  # No carrier
+    }
+
+    @staticmethod
+    def generate_device_id() -> str:
+        """Generate a realistic iOS device ID."""
+        return uuid.uuid4().hex[:16]  # iOS uses 16-byte device IDs
+
+    @staticmethod
+    def generate_install_id() -> str:
+        """Generate an installation ID in UUID format."""
+        return str(uuid.uuid4()).upper()
+
+    @staticmethod
+    def parse_ios_version(version_str: str) -> int:
+        """Convert iOS version string to numeric format."""
+        # Split version string and pad with zeros if needed
+        parts = version_str.split('.')
+        while len(parts) < 3:
+            parts.append('0')
+        major, minor, patch = map(int, parts)
+        return (major * 10000000000) + (minor * 100000000) + (patch * 1000000)
+
+    @classmethod
+    def generate_profile(cls) -> Tuple[Dict[str, any], DeviceProfile]:
+        """Generate a complete device profile with consistent information."""
+        # Select random device profile
+        device_profile = random.choice(cls.IOS_DEVICES)
+        
+        # Generate consistent IDs
+        device_id = cls.generate_device_id()
+        install_id = cls.generate_install_id()
+        session_id = str(uuid.uuid4()).upper()
+        
+        # Get carrier codes
+        mcc, mnc = cls.CARRIERS.get(device_profile.carrier or "", (0, 0))
+        
+        # Create user agent - note we use the first two parts of version for user agent
+        display_version = '.'.join(device_profile.os_version.split('.')[:2])
+        user_agent = (f"Tinder/14.21.0 ({device_profile.device_model}; "
+                     f"iOS {display_version}; Scale/2.00)")
+        
+        # Create complete profile
+        profile = {
+            "userAgent": user_agent,
+            "persistentDeviceId": device_id,
+            "installId": install_id,
+            "appSessionId": session_id,
+            "encodedDeviceModel": device_profile.encode(),
+            "encodedDeviceCarrier": (base64.b64encode(device_profile.carrier.encode()).decode() 
+                                   if device_profile.carrier else ""),
+            "mobileCountryCode": mcc,
+            "mobileNetworkCode": mnc,
+            "osVersion": cls.parse_ios_version(device_profile.os_version),
+            "platform": "ios",
+            "language": "en-US",
+            "tinderVersion": "14.21.0",
+            "appVersion": "5546"
+        }
+        
+        return profile, device_profile
 
 def generateAppsFlyerId() -> str:
     part1 = str(random.randint(0, int(1e13))).zfill(13)[:13]
@@ -39,31 +131,28 @@ def generateAppsFlyerId() -> str:
 def bytes2base64(b: bytes) -> str:
     return base64.b64encode(b).decode('utf-8')
 
-# iOS     Tinder (max version)
-# 14.2    14.21 (14.22+ require ios 15.0+;) | 13.24.0+- =>ios14.0+
 class TinderClient:
     def __init__(
             self,
-            userAgent: str = None, # Tinder/15.16.0 (iPhone; iOS 17.6; Scale/2.00) | Tinder Android Version 15.16.0
+            userAgent: str = None,
             proxy: str = None,
-            persistentDeviceId: str = None, # hex: ios=16bytes, android=8bytes
-            appSessionId: str = None, # ios=UUID, android=uuid => random each boot
-            #appSessionStartTime: int = None, # ios=float, android=float:.3f
-            installId: str = None, # ios=UUID, android=8bytes
-            encodedDeviceModel: str = None, # base64: ios=iPhone16,2|iphone9,2, android=wp11
-            encodedDeviceCarrier: str = 'd2lmaQ', # ios=EMPTY, android='wifi'<=>d2lmaQ=bytes2base64("wifi".encode()); QVQmVA== <=> AT&T
-            mobileCountryCode: int = 310, # EMPTYable (MCC): United States of America
-            mobileNetworkCode: int = 240, # EMPTYable (MNC): T-Mobile
-            tinderVersion: str = "14.21.0",
-            appVersion: str = "5546",
-            storeVariant: str = None, # android only: Play-Store
-            osVersion: int = 140000200000, # android=API_Level, ios=150000800002 (15.8.2) -> 140000200000 (14.2.0)
-            platform: str = "ios", # ios, android
-            platformVariant: str = None, # android only: Google-Play
-            language: str = "en-us", # accept-language: en-GB,en;q=0.9
-            funnelSessionId: str = None, # ios=16bytes, android=uuid => random each boot
-            appsFlyerId: str = None, #ios=EMPTY
-            advertisingId: str = None, # nullable
+            persistentDeviceId: str = None,
+            appSessionId: str = None,
+            installId: str = None,
+            encodedDeviceModel: str = None,
+            encodedDeviceCarrier: str = None,
+            mobileCountryCode: int = None,
+            mobileNetworkCode: int = None,
+            tinderVersion: str = None,
+            appVersion: str = None,
+            storeVariant: str = None,
+            osVersion: int = None,
+            platform: str = None,
+            platformVariant: str = None,
+            language: str = None,
+            funnelSessionId: str = None,
+            appsFlyerId: str = None,
+            advertisingId: str = None,
             refreshToken: str = None,
             userId: str = None,
             onboardingToken: str = None,
@@ -72,69 +161,88 @@ class TinderClient:
             appId: str = None,
             userSessionStartTime: int = 0
     ):
-        app_boot_time = random.uniform(40, 50) # random boot time
-        if installId: # only when reload
+        # Generate device profile if minimal params aren't provided
+        if not all([userAgent, persistentDeviceId, encodedDeviceModel, osVersion]):
+            profile, device_profile = DeviceProfileManager.generate_profile()
+            self.device_profile = device_profile
+            
+            # Apply generated profile settings
+            userAgent = profile["userAgent"]
+            persistentDeviceId = profile["persistentDeviceId"]
+            installId = profile["installId"]
+            encodedDeviceModel = profile["encodedDeviceModel"]
+            encodedDeviceCarrier = profile["encodedDeviceCarrier"]
+            mobileCountryCode = profile["mobileCountryCode"]
+            mobileNetworkCode = profile["mobileNetworkCode"]
+            osVersion = profile["osVersion"]
+            platform = profile["platform"]
+            language = profile["language"]
+            tinderVersion = profile["tinderVersion"]
+            appVersion = profile["appVersion"]
+        
+        app_boot_time = random.uniform(40, 50)
+        if installId:
             self.first_boot = False
         else:
             self.first_boot = True
         
         self.appSessionId = appSessionId or str(uuid.uuid4()).upper()
-        #self.appSessionStartTime = appSessionStartTime or time.time() # null\
         self.appSessionStartTime = time.time() - app_boot_time
-        self.persistentDeviceId = persistentDeviceId or os.urandom(16).hex()
-        self.installId = installId or str(uuid.uuid4()).upper()
-        self.encodedDeviceModel = encodedDeviceModel or bytes2base64(b"iphone9,2") # 7+ TODO: random model
+        self.persistentDeviceId = persistentDeviceId
+        self.installId = installId
+        self.encodedDeviceModel = encodedDeviceModel
         self.encodedDeviceCarrier = encodedDeviceCarrier
         self.mobileCountryCode = mobileCountryCode
         self.mobileNetworkCode = mobileNetworkCode
-        self.tinderVersion = tinderVersion
-        self.appVersion = appVersion
+        self.tinderVersion = tinderVersion or "14.21.0"
+        self.appVersion = appVersion or "5546"
         self.storeVariant = storeVariant
-        self.language = language
+        self.language = language or "en-US"
         self.platformVariant = platformVariant
-        self.platform = platform
+        self.platform = platform or "ios"
         self.osVersion = osVersion
-        self.userAgent = userAgent or f"Tinder/{self.tinderVersion} (iPhone; iOS 14.2.0; Scale/2.00)" # TODO: osVersion
-        #self.appsFlyerId = appsFlyerId or '' # generateAppsFlyerId() # ios=EMPTY
-        self.appsFlyerId = appsFlyerId or generateAppsFlyerId() # ios=EMPTY or Value
-        self.advertisingId = advertisingId or str(uuid.uuid4()) # android only?
+        self.userAgent = userAgent
+        self.appsFlyerId = appsFlyerId or generateAppsFlyerId()
+        self.advertisingId = advertisingId or str(uuid.uuid4())
         self.funnelSessionId = funnelSessionId or os.urandom(16).hex()
         self.onboardingToken = onboardingToken
         self.userId = userId
         self.refreshToken = refreshToken
         self.xAuthToken = xAuthToken
+
         if xAuthToken:
-            # logged only (onboarding complete)
             self.userSessionId = userSessionId or str(uuid.uuid4()).upper()
             self.userSessionStartTime = time.time() - app_boot_time
         else:
-            # skip it empty
             self.userSessionId = userSessionId
             self.userSessionStartTime = userSessionStartTime
 
-        # NOTE: login will set app_id value (using phonenumber)
-        # this need for ios_device_id spoof (pass Tinder but not Apple)
-        self.app_id = appId or None
-        
+        self.app_id = appId
         self.httpProxy = proxy
         self.app_seconds = 0
         self.user_seconds = 0
-        #self.x_device_ram = '3' # TODO: random RAM (android only)
         self.last_status_code = 0
-
-        # on iOS, payload joined with previous
         self.onboardingPayload = []
-        
-        # android
-        #self.URL_ONBOARDING = 'https://api.gotinder.com/v2/onboarding/fields?requested=tinder_rules&requested=name&requested=birth_date&requested=gender&requested=custom_gender&requested=show_gender_on_profile&requested=photos&requested=email&requested=allow_email_marketing&requested=consents&requested=schools&requested=interested_in_gender&requested=interested_in_genders&requested=show_same_orientation_first&requested=show_orientation_on_profile&requested=sexual_orientations&requested=user_interests&requested=relationship_intent&requested=distance_filter&requested=basics&requested=lifestyle'
-        #self.URL_ONBOARDING_COMPLETE = 'https://api.gotinder.com/v2/onboarding/complete'
-        
-        # ios 14.21.0
+
         self.URL_ONBOARDING = 'https://api.gotinder.com/v2/onboarding/fields?requested=name&requested=birth_date&requested=gender&requested=custom_gender&requested=show_gender_on_profile&requested=photos&requested=schools&requested=consents&requested=videos_processing&requested=sexual_orientations&requested=show_same_orientation_first&requested=show_orientation_on_profile&requested=interested_in_gender&requested=user_interests&requested=distance_filter&requested=tinder_rules&requested=relationship_intent&requested=basics&requested=lifestyle'
         self.URL_ONBOARDING_PHOTO = self.URL_ONBOARDING.replace('/fields?', '/photo?', 1)
         self.URL_ONBOARDING_COMPLETE = self.URL_ONBOARDING.replace('/fields?', '/complete?', 1)
-
         self.URL_DEVICE_CHECK = 'https://api.gotinder.com/v2/device-check/ios'
+
+    def rotate_device(self):
+        """Rotate device profile while maintaining session data."""
+        profile, device_profile = DeviceProfileManager.generate_profile()
+        
+        # Update device-specific attributes
+        self.userAgent = profile["userAgent"]
+        self.encodedDeviceModel = profile["encodedDeviceModel"]
+        self.encodedDeviceCarrier = profile["encodedDeviceCarrier"]
+        self.mobileCountryCode = profile["mobileCountryCode"]
+        self.mobileNetworkCode = profile["mobileNetworkCode"]
+        self.osVersion = profile["osVersion"]
+        self.device_profile = device_profile
+        
+        return self
 
     @staticmethod
     def fromObject(o: dict) -> 'TinderClient':
@@ -154,23 +262,12 @@ class TinderClient:
             'appVersion': self.appVersion,
             'osVersion': self.osVersion,
             'platform': self.platform,
-            #'platformVariant': self.platformVariant, # ANDROID only
-            #'storeVariant': self.storeVariant, # ANDROID only
-            #'appSessionId': self.appSessionId, # reload => new session => no need save
-            #'appSessionStartTime': self.appSessionStartTime, # same as appSessionId
             'encodedDeviceModel': self.encodedDeviceModel,
             'encodedDeviceCarrier': self.encodedDeviceCarrier,
-            #'mobileCountryCode': self.mobileCountryCode,
-            #'mobileNetworkCode': self.mobileNetworkCode,
             'appsFlyerId': self.appsFlyerId,
-            #'advertisingId': self.advertisingId, # looklike ANDROID only
-            #'funnelSessionId': self.funnelSessionId, # reload => new session => no need save
-            #'userSessionId': self.userSessionId, # reload => new session => no need save
             'language': self.language,
-            #'userSessionStartTime': self.userSessionStartTime, # same as appSessionId
-            'proxy' : self.httpProxy
+            'proxy': self.httpProxy
         }
-
         return o
 
     def toJSON(self) -> str:
@@ -182,44 +279,15 @@ class TinderClient:
 
     def loadProxy():
         print("fetch proxy...")
-        ### C Proxy (local debug)
-        #return None
-        #return 'http://127.0.0.1:8080' # mitm
-        #return 'http://192.168.1.188:8080' # burp
-        #return 'http://127.0.0.1:8888' # fidder
-        
-        ### Kiran oxylabs
-        # s = 'http://customer-kiranhi-cc-us-sessid-0721593567-sesstime-30:Simpletest1_@pr.oxylabs.io:7777'
-        # lst = list(range(1, 40))
-        # random.shuffle(lst)
-        # for iter in lst:
-        #     proxy = s.replace('721593567', str(721593567 + iter - 1))
-        #     print(proxy)
-        #     try:
-        #         response = http_async_sesion.get(url="https://api64.ipify.org?format=text", proxy=proxy)
-        #         ip = response.text
-        #         print(ip)
-
-        #         scamalytics_response = http_async_sesion.get(url="https://scamalytics.com/ip/" + ip)
-        #         match = re.search(r'Fraud Score:\s*(\d+(?:\.\d+)?)', scamalytics_response.text, re.DOTALL)
-        #         fraud_score = int(match.group(1))
-                
-        #         print("fraud_score: " + str(fraud_score))
-        #         if fraud_score < 4:
-        #             return proxy
-        #     except: continue
-        #     finally: print('--')
-        # raise Exception()
-        
-        return None # TODO: 
+        return None
 
     def getAppSessionTimeElapsed(self) -> float:
-        self.app_seconds = time.time() - self.appSessionStartTime # Real delay with sleep
-        #self.app_seconds += random.uniform(30, 90) # Fake appSessionStartTime
+        self.app_seconds = time.time() - self.appSessionStartTime
         return self.app_seconds
 
     def getUserSessionTimeElapsed(self) -> float:
-        if self.userSessionStartTime == 0: return None # not yet
+        if self.userSessionStartTime == 0:
+            return None
         self.user_seconds = time.time() - self.userSessionStartTime
         return self.user_seconds
 
@@ -230,36 +298,41 @@ class TinderClient:
         
         if 'refresh_token' in data:
             self.refreshToken = data['refresh_token']
-            if type(self.refreshToken) is dict: self.refreshToken = self.refreshToken['value']
+            if type(self.refreshToken) is dict:
+                self.refreshToken = self.refreshToken['value']
             print("refresh_token: " + self.refreshToken)
 
         if 'user_id' in data:
             self.userId = data['user_id']
-            if type(self.userId) is dict: self.userId = self.userId['value']
+            if type(self.userId) is dict:
+                self.userId = self.userId['value']
             print("userId: " + self.userId)
 
         if 'onboarding_token' in data:
             self.onboardingToken = data['onboarding_token']
-            if type(self.onboardingToken) is dict: self.onboardingToken = self.onboardingToken['value']
+            if type(self.onboardingToken) is dict:
+                self.onboardingToken = self.onboardingToken['value']
             print("onboardingToken: " + self.onboardingToken)
+
         if 'auth_token' in data:
             self.xAuthToken = data['auth_token']
-            if type(self.xAuthToken) is dict: self.xAuthToken = self.xAuthToken['value']
+            if type(self.xAuthToken) is dict:
+                self.xAuthToken = self.xAuthToken['value']
             print("xAuthToken: " + self.xAuthToken)
-            self.onboardingToken = None # registered
+            self.onboardingToken = None  # registered
         
-        if 'auth_token_ttl' in data: # LoginResult login_result
+        if 'auth_token_ttl' in data:  # LoginResult login_result
             self.userSessionId = str(uuid.uuid4()).upper()
             self.userSessionStartTime = time.time()
             print("userSessionId: " + self.userSessionId)
 
     def _getHeaders_POST_Protobuf(self):
         headers = {
-            "Accept": "application/x-protobuf", # ios only
+            "Accept": "application/x-protobuf",
             "persistent-device-id": self.persistentDeviceId,
             "User-Agent": self.userAgent,
             "encoded-device-carrier": self.encodedDeviceCarrier,
-            "x-hubble-entity-id": str(uuid.uuid4()), # ios only
+            "x-hubble-entity-id": str(uuid.uuid4()),
             "os-version": str(self.osVersion),
             "Locale": "en",
             "app-session-time-elapsed": None,
@@ -1010,27 +1083,47 @@ class TinderClient:
         return response
     
     ### BOT ENGINE
-    def processCaptcha(self):
-        tinder = self
-        if tinder.last_status_code != 200:
-            r = tinder.getAuthToken()
-            pretty_json = json.dumps(r, indent=4)
-            print('AuthToken:\r\n' + pretty_json)
-            token: str = r['error']['ban_reason']['ban_appeal']['challenge_token']
-            tokenUP = token.upper()
+def processCaptcha(self):
+    """
+    Handle the captcha challenge process.
+    Returns True if captcha was processed successfully, False otherwise.
+    """
+    try:
+        if self.last_status_code != 200:
+            # Get auth token response
+            r = self.getAuthToken()
+            print('AuthToken Response:', json.dumps(r, indent=4))
 
-            # https://demo.arkoselabs.com/?key=DF9C4D87-CB7B-4062-9FEB-BADB6ADA61E6
-            # https://tinder-api.arkoselabs.com/v2/EBC0462E-1FD4-25CD-A21E-A68A0E5DDB23/api.js
-            print('Token:\r\n' + tokenUP)
-            #print('file:///R:/zcaptcha.html?key=' + tokenUP)
-            print('https://192.168.1.188/zcaptcha.html?key=' + tokenUP)
-            answer = input("anwser: ")
-            r = tinder.challengeVerifyArkose(token, answer)
-            print(r)
+            # Check if response contains error with challenge token
+            if isinstance(r, dict) and 'error' in r:
+                error_data = r.get('error', {})
+                ban_reason = error_data.get('ban_reason', {})
+                ban_appeal = ban_reason.get('ban_appeal', {})
+                token = ban_appeal.get('challenge_token')
 
-            r = tinder.getAuthToken() # only if onboarding or banned=>after captcha
-            print(r)
-            return True
+                if token:
+                    tokenUP = token.upper()
+                    print('Token:', tokenUP)
+                    print('https://192.168.1.188/zcaptcha.html?key=' + tokenUP)
+                    answer = input("answer: ")
+                    
+                    # Verify the captcha
+                    r = self.challengeVerifyArkose(token, answer)
+                    print("Challenge verify response:", r)
+
+                    # Try getting auth token again
+                    r = self.getAuthToken()
+                    print("Final auth response:", r)
+                    return True
+                else:
+                    print("No challenge token found in response")
+                    return False
+            else:
+                print("No error information found in response")
+                return False
+        return False
+    except Exception as e:
+        print(f"Error during captcha processing: {str(e)}")
         return False
 
     def _ws_on_message(ws, message):
